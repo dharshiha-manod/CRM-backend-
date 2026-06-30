@@ -8,6 +8,8 @@
  */
 
 'use strict';
+const transporter = require("../services/emailService");
+
 
 const pool = require('../config/database');
 

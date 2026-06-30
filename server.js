@@ -1,6 +1,6 @@
 /**
  * ====================================================
- * MANOD ERP BACKEND - MAIN SERVER
+ * MANOD CRM BACKEND - MAIN SERVER
  * Node.js + Express + PostgreSQL
  * ====================================================
  */
@@ -32,40 +32,13 @@ app.use((req, res, next) => {
 const pool = require('./config/database');
 
 // ── ROUTES ───────────────────────────────────────────────────
-const authRoutes            = require('./routes/auth');
-const userRoutes            = require('./routes/users');
-const roleRoutes            = require('./routes/roles');
-const commissionAgentRoutes = require('./routes/commissionAgentsroutes');
-const contactRoutes         = require('./routes/contacts');
-const productRoutes         = require('./routes/products');   // ← PRODUCT MODULE
-const stockTransferRoutes   = require('./routes/stockTransfers'); // ← STOCK TRANSFER MODULE (NEW)
-const stockAdjustmentRoutes = require('./routes/stockAdjustments'); // ← STOCK ADJUSTMENT
-const manufacturingRoutes   = require('./routes/manufacturing');
-const expenseRoutes         = require('./routes/expenses');
-const purchaseRoutes        = require('./routes/purchases');
-const purchaseReturnRoutes  = require('./routes/purchaseReturns');
-const notificationTemplateRoutes = require('./routes/notificationTemplates'); // ← NOTIFICATION TEMPLATES
-const hrmRoutes = require('./routes/hrm');
-const crmRoutes = require('./routes/crm');
+const authRoutes = require('./routes/auth');
+const userRoutes = require('./routes/users');
+const crmRoutes  = require('./routes/crm');
 
-
-
-
-app.use('/api/auth',                    authRoutes);
-app.use('/api/users',                   userRoutes);
-app.use('/api/roles',                   roleRoutes);
-app.use('/api/sales-commission-agents', commissionAgentRoutes);
-app.use('/api/contacts',                contactRoutes);
-app.use('/api/products',                productRoutes);       // ← PRODUCT MODULE
-app.use('/api/stock-transfers',         stockTransferRoutes); // ← STOCK TRANSFER MODULE (NEW)
-app.use('/api/stock-adjustments',       stockAdjustmentRoutes); // ← STOCK ADJUSTMENT
-app.use('/api/manufacturing',           manufacturingRoutes);
-app.use('/api/expenses',                expenseRoutes);
-app.use('/api/purchases',               purchaseRoutes);
-app.use('/api/purchase-returns',        purchaseReturnRoutes);
-app.use('/api/notification-templates',  notificationTemplateRoutes); // ← NOTIFICATION TEMPLATES
-app.use('/api/hrm', hrmRoutes);
-app.use('/api/crm', crmRoutes);
+app.use('/api/auth',  authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/crm',   crmRoutes);
 
 // ── HEALTH CHECK ─────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
@@ -79,28 +52,13 @@ app.get('/api/health', (req, res) => {
 // ── ROOT ─────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    message:  'Manod ERP Backend API',
+    message:  'Manod CRM Backend API',
     version:  '1.0.0',
     endpoints: {
-      health:                   '/api/health',
-      auth:                     '/api/auth',
-      users:                    '/api/users',
-      roles:                    '/api/roles',
-      commissionAgents:         '/api/sales-commission-agents',
-      contacts:                 '/api/contacts',
-      products:                 '/api/products',
-      brands:                   '/api/products/brands',
-      units:                    '/api/products/units',
-      variations:               '/api/products/variations',
-      categories:               '/api/products/categories',
-      warranties:               '/api/products/warranties',
-      stockTransfers:           '/api/stock-transfers',
-      stockAdjustments:         '/api/stock-adjustments',
-      manufacturing:            '/api/manufacturing',
-      expenses:                 '/api/expenses',
-      purchases:                '/api/purchases',
-      purchaseReturns:          '/api/purchase-returns',
-      notificationTemplates:    '/api/notification-templates'
+      health: '/api/health',
+      auth:   '/api/auth',
+      users:  '/api/users',
+      crm:    '/api/crm'
     }
   });
 });
@@ -125,15 +83,10 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
-║   🚀 MANOD ERP BACKEND STARTED               ║
+║   🚀 MANOD CRM BACKEND STARTED               ║
 ╠══════════════════════════════════════════════╣
 ║   Server: http://localhost:${PORT}            ║
 ║   Environment: ${process.env.NODE_ENV || 'development'}              ║
-║   Products Module ✓                         ║
-║   Warranties Module ✓                       ║
-║   Opening Stock Import ✓                    ║
-║   Stock Transfer Module ✓                   ║
-║   Notification Templates Module ✓           ║
 ╚══════════════════════════════════════════════╝
   `);
 });
