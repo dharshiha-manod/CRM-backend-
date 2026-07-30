@@ -24,7 +24,8 @@
     "express": "^4.22.2",
     "jsonwebtoken": "^9.0.3",
     "nodemailer": "^9.0.3",
-    "pg": "^8.21.0"
+    "pg": "^8.21.0",
+    "twilio": "^6.0.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
