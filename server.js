@@ -49,7 +49,7 @@ app.use(cors({
 
 app.options('*', cors());
 
-app.use(express.json());
+app.use(express.json({ limit: '8mb' })); (collegue)
 app.use(express.urlencoded({ extended: true }));
 
 // Request logging
@@ -64,10 +64,12 @@ const pool = require('./config/database');
 // â”€â”€ ROUTES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
+const roleRoutes = require('./routes/roles');
 const crmRoutes  = require('./routes/crm');
 
 app.use('/api/auth',  authRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/roles', roleRoutes);
 app.use('/api/crm',   crmRoutes);
 
 // â”€â”€ HEALTH CHECK â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

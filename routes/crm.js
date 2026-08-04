@@ -3,8 +3,16 @@ const router = express.Router();
 const crypto = require('crypto');
 
 const authenticateToken = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permission');
 const pool = require('../config/database');
 const transporter = require('../services/emailService');
+
+// Every internal CRM endpoint requires a valid login. Public proposal links
+// remain accessible through their cryptographically random proposal token.
+router.use((req, res, next) => {
+  if (req.path.startsWith('/public/proposals/')) return next();
+  return authenticateToken(req, res, next);
+});
 
 let twilioFactory = null;
 try {
@@ -49,15 +57,74 @@ const ensureLeadExtraColumns = async () => {
       ADD COLUMN IF NOT EXISTS additional_number TEXT,
       ADD COLUMN IF NOT EXISTS custom_fields JSONB DEFAULT '{}'::jsonb,
       ADD COLUMN IF NOT EXISTS contact_persons JSONB DEFAULT '[]'::jsonb,
-      ADD COLUMN IF NOT EXISTS lead_details JSONB DEFAULT '{}'::jsonb
+      ADD COLUMN IF NOT EXISTS lead_details JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS product_category TEXT,
+      ADD COLUMN IF NOT EXISTS machine_type TEXT,
+      ADD COLUMN IF NOT EXISTS application TEXT,
+      ADD COLUMN IF NOT EXISTS requirement_quantity INTEGER,
+      ADD COLUMN IF NOT EXISTS installation_location TEXT,
+      ADD COLUMN IF NOT EXISTS requirement_details TEXT,
+      ADD COLUMN IF NOT EXISTS budget NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS expected_purchase_date DATE,
+      ADD COLUMN IF NOT EXISTS quotation_value NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS competitor_details TEXT,
+      ADD COLUMN IF NOT EXISTS next_followup_date TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS next_followup_activity TEXT,
+      ADD COLUMN IF NOT EXISTS gps_latitude DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS gps_longitude DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS gps_accuracy DOUBLE PRECISION,
+      ADD COLUMN IF NOT EXISTS gps_captured_at TIMESTAMP
     `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS crm_lead_locations (
+        id SERIAL PRIMARY KEY,
+        lead_id TEXT NOT NULL,
+        latitude DOUBLE PRECISION NOT NULL,
+        longitude DOUBLE PRECISION NOT NULL,
+        accuracy DOUBLE PRECISION,
+        capture_source TEXT NOT NULL DEFAULT 'lead_form',
+        captured_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS crm_lead_locations_lead_id_idx ON crm_lead_locations (lead_id)`);
   } catch (err) {
     console.error('lead extra column setup failed:', err.message);
   }
 };
 ensureLeadExtraColumns();
 
+const ensureCrmSettingsTable = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      company_name TEXT NOT NULL DEFAULT 'Manod Technologies',
+      currency TEXT NOT NULL DEFAULT 'INR',
+      default_assigned TEXT,
+      default_stage TEXT NOT NULL DEFAULT 'New',
+      default_source TEXT NOT NULL DEFAULT 'Website',
+      updated_by TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`INSERT INTO crm_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
+};
+ensureCrmSettingsTable().catch((err) => console.error('CRM settings table setup failed:', err.message));
+
 const jsonValue = (value, fallback) => JSON.stringify(value ?? fallback);
+const saveLeadLocationHistory = async (leadId, body = {}) => {
+  const latitude = Number(body.gpsLatitude ?? body.gps_latitude);
+  const longitude = Number(body.gpsLongitude ?? body.gps_longitude);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
+  await pool.query(
+    `INSERT INTO crm_lead_locations (lead_id, latitude, longitude, accuracy, capture_source, captured_at)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [String(leadId), latitude, longitude,
+      Number.isFinite(Number(body.gpsAccuracy ?? body.gps_accuracy)) ? Number(body.gpsAccuracy ?? body.gps_accuracy) : null,
+      body.gpsSource || body.gps_source || 'lead_form', body.gpsCapturedAt || body.gps_captured_at || new Date()]
+  );
+};
 const ensureProposalAutomationColumns = async () => {
   await pool.query(`
     ALTER TABLE crm_proposals
@@ -78,6 +145,187 @@ const ensureProposalAutomationColumns = async () => {
   `);
 };
 ensureProposalAutomationColumns().catch((err) => console.error('proposal automation column setup failed:', err.message));
+
+const ensureDailyDigestTable = async () => {
+  await pool.query(`ALTER TABLE crm_followups ADD COLUMN IF NOT EXISTS assigned_user_id TEXT`);
+  await pool.query(`
+    UPDATE crm_followups f
+    SET assigned_user_id=u.id::text
+    FROM users u
+    WHERE f.assigned_user_id IS NULL
+      AND LOWER(TRIM(COALESCE(f.assigned, ''))) = LOWER(TRIM(COALESCE(u.full_name, '')))
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_daily_digest_log (
+      id SERIAL PRIMARY KEY,
+      digest_date DATE NOT NULL,
+      recipient_email TEXT NOT NULL,
+      digest_type TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'processing',
+      sent_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (digest_date, recipient_email, digest_type)
+    )
+  `);
+};
+ensureDailyDigestTable().catch((err) => console.error('daily digest table setup failed:', err.message));
+
+const ensureMachineServiceTables = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_installed_machines (
+      id SERIAL PRIMARY KEY,
+      lead_id TEXT,
+      customer_name TEXT NOT NULL,
+      machine_model TEXT NOT NULL,
+      serial_number TEXT UNIQUE,
+      installation_date DATE,
+      warranty_start DATE,
+      warranty_end DATE,
+      next_maintenance DATE,
+      spare_requirement TEXT,
+      amc_status TEXT DEFAULT 'Not Applicable',
+      amc_start DATE,
+      amc_end DATE,
+      location TEXT,
+      assigned_user_id TEXT,
+      assigned TEXT,
+      status TEXT DEFAULT 'Active',
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_machine_services (
+      id SERIAL PRIMARY KEY,
+      machine_id INTEGER NOT NULL REFERENCES crm_installed_machines(id) ON DELETE CASCADE,
+      service_date DATE NOT NULL,
+      service_type TEXT DEFAULT 'Preventive Maintenance',
+      issue_reported TEXT,
+      work_performed TEXT,
+      spare_used TEXT,
+      technician TEXT,
+      next_service_date DATE,
+      status TEXT DEFAULT 'Completed',
+      cost NUMERIC DEFAULT 0,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    ALTER TABLE crm_machine_services
+      ADD COLUMN IF NOT EXISTS service_category TEXT DEFAULT 'Preventive Maintenance',
+      ADD COLUMN IF NOT EXISTS assigned_technician_id TEXT,
+      ADD COLUMN IF NOT EXISTS customer_contact_name TEXT,
+      ADD COLUMN IF NOT EXISTS customer_contact_phone TEXT,
+      ADD COLUMN IF NOT EXISTS coverage_status TEXT DEFAULT 'Chargeable',
+      ADD COLUMN IF NOT EXISTS resolution_status TEXT DEFAULT 'Resolved',
+      ADD COLUMN IF NOT EXISTS labor_cost NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS spare_cost NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS travel_cost NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS downtime_start TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS downtime_end TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS downtime_minutes INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS customer_confirmation_name TEXT,
+      ADD COLUMN IF NOT EXISTS customer_feedback TEXT,
+      ADD COLUMN IF NOT EXISTS customer_rating INTEGER
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_machine_service_attachments (
+      id SERIAL PRIMARY KEY,
+      service_id INTEGER NOT NULL REFERENCES crm_machine_services(id) ON DELETE CASCADE,
+      file_name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      file_size INTEGER NOT NULL,
+      file_data BYTEA NOT NULL,
+      uploaded_by TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_machine_consumables (
+      id SERIAL PRIMARY KEY,
+      machine_id INTEGER REFERENCES crm_installed_machines(id) ON DELETE CASCADE,
+      lead_id TEXT,
+      customer_name TEXT NOT NULL,
+      item_name TEXT NOT NULL,
+      category TEXT DEFAULT 'Consumable',
+      quantity NUMERIC DEFAULT 0,
+      unit TEXT DEFAULT 'Nos',
+      reorder_level NUMERIC DEFAULT 0,
+      last_supplied_date DATE,
+      next_requirement_date DATE,
+      unit_price NUMERIC DEFAULT 0,
+      status TEXT DEFAULT 'Active',
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    ALTER TABLE crm_machine_consumables
+      ADD COLUMN IF NOT EXISTS sku TEXT,
+      ADD COLUMN IF NOT EXISTS brand TEXT,
+      ADD COLUMN IF NOT EXISTS specification TEXT,
+      ADD COLUMN IF NOT EXISTS supply_type TEXT DEFAULT 'Sale',
+      ADD COLUMN IF NOT EXISTS order_invoice_number TEXT,
+      ADD COLUMN IF NOT EXISTS purchase_cost NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS tax_percent NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_supplied_quantity NUMERIC DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS consumption_frequency TEXT DEFAULT 'Monthly',
+      ADD COLUMN IF NOT EXISTS frequency_days INTEGER DEFAULT 30,
+      ADD COLUMN IF NOT EXISTS assigned_user_id TEXT,
+      ADD COLUMN IF NOT EXISTS assigned TEXT,
+      ADD COLUMN IF NOT EXISTS opportunity_status TEXT DEFAULT 'Reminder Due',
+      ADD COLUMN IF NOT EXISTS customer_contact_name TEXT,
+      ADD COLUMN IF NOT EXISTS customer_contact_phone TEXT
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_machine_replacement_opportunities (
+      id SERIAL PRIMARY KEY,
+      machine_id INTEGER REFERENCES crm_installed_machines(id) ON DELETE SET NULL,
+      lead_id TEXT,
+      customer_name TEXT NOT NULL,
+      current_model TEXT,
+      replacement_reason TEXT,
+      proposed_model TEXT,
+      expected_purchase_date DATE,
+      estimated_value NUMERIC DEFAULT 0,
+      stage TEXT DEFAULT 'New',
+      assigned_user_id TEXT,
+      assigned TEXT,
+      status TEXT DEFAULT 'Open',
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS crm_machine_automation_log (
+      id SERIAL PRIMARY KEY,
+      event_key TEXT NOT NULL,
+      recipient_email TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'processing',
+      sent_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (event_key, recipient_email)
+    )
+  `);
+};
+ensureMachineServiceTables().catch((err) => console.error('machine service table setup failed:', err.message));
+
+const ensureMachineServicePermissions = async () => {
+  for (const name of ['View machine service', 'Add machine service', 'Edit machine service', 'Delete machine service']) {
+    await pool.query(
+      `INSERT INTO permissions (group_name, name)
+       SELECT 'Machine Service', $1
+       WHERE NOT EXISTS (SELECT 1 FROM permissions WHERE group_name='Machine Service' AND name=$1)`,
+      [name]
+    );
+  }
+};
+ensureMachineServicePermissions().catch((err) => console.error('machine service permission setup failed:', err.message));
 const CUSTOMER_SUCCESS_STAGES = [
   'Order Confirmed',
   'Invoice Generated',
@@ -238,6 +486,18 @@ const addDays = (days) => {
 
 const leadNameOf = (lead) => lead?.name || lead?.lead_name || '';
 const leadAssignedOf = (lead) => lead?.assigned || null;
+const resolveAssignedUserId = async (assigned, assignedUserId) => {
+  if (assignedUserId) {
+    const { rows } = await pool.query('SELECT id::text AS id FROM users WHERE id::text=$1 LIMIT 1', [String(assignedUserId)]);
+    if (rows[0]) return rows[0].id;
+  }
+  if (!assigned) return null;
+  const { rows } = await pool.query(
+    `SELECT id::text AS id FROM users WHERE LOWER(TRIM(full_name))=LOWER(TRIM($1)) LIMIT 1`,
+    [assigned]
+  );
+  return rows[0]?.id || null;
+};
 const resolveLinkedLeadName = async (value) => {
   const input = String(value || '').trim();
   if (!input) return null;
@@ -317,6 +577,279 @@ const safeSendMail = async (mailOptions) => {
   } catch (err) {
     console.error('automation email failed:', err.code || '', err.command || '', err.message);
     return false;
+  }
+};
+
+const escapeHtml = (value) => String(value ?? '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
+const indiaNowParts = () => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+  };
+};
+
+const formatFollowupTime = (value) => value
+  ? new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true,
+    }).format(new Date(value))
+  : 'Time not set';
+
+const followupRowsHtml = (rows) => {
+  if (!rows.length) return '<p style="padding:14px;background:#f4f7f5;border-radius:8px;">No follow-ups scheduled for today.</p>';
+  return `
+    <table style="width:100%;border-collapse:collapse;font-size:13px;">
+      <thead><tr style="background:#166534;color:#fff;">
+        <th style="padding:9px;text-align:left;">Schedule</th>
+        <th style="padding:9px;text-align:left;">Lead</th>
+        <th style="padding:9px;text-align:left;">Follow-up</th>
+        <th style="padding:9px;text-align:left;">Type</th>
+        <th style="padding:9px;text-align:left;">Status</th>
+      </tr></thead>
+      <tbody>${rows.map((item) => `
+        <tr>
+          <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${item.is_overdue ? `<strong style="color:#b42318;">Overdue</strong><br/>${escapeHtml(item.start_date_label)} ${escapeHtml(item.start_time_label || '')}` : escapeHtml(item.start_time_label || formatFollowupTime(item.start_time))}</td>
+          <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.lead_name || '-')}</td>
+          <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.title || '-')}</td>
+          <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.type || '-')}</td>
+          <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.status || '-')}</td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+};
+
+const claimDailyDigest = async (date, email, type) => {
+  const { rows } = await pool.query(
+    `INSERT INTO crm_daily_digest_log (digest_date, recipient_email, digest_type)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (digest_date, recipient_email, digest_type) DO NOTHING
+     RETURNING id`,
+    [date, email.toLowerCase(), type]
+  );
+  return rows[0]?.id || null;
+};
+
+const deliverClaimedDigest = async ({ claimId, to, subject, html }) => {
+  const sent = await safeSendMail({
+    from: `"Manod CRM" <${process.env.EMAIL_USER}>`, to, subject, html,
+  });
+  if (sent) {
+    await pool.query(`UPDATE crm_daily_digest_log SET status='sent', sent_at=NOW() WHERE id=$1`, [claimId]);
+  } else {
+    await pool.query('DELETE FROM crm_daily_digest_log WHERE id=$1', [claimId]);
+  }
+  return sent;
+};
+
+const resolveDigestRecipients = async (followups = []) => {
+  const { rows: users } = await pool.query(`
+    SELECT id::text AS id, full_name, email, role, department
+    FROM users
+    WHERE LOWER(COALESCE(status, 'active'))='active' AND COALESCE(email, '') <> ''
+  `);
+  const configuredSalespeople = SALES_TEAM.map((person) => {
+    const user = users.find((item) => normalize(item.full_name) === normalize(person.name));
+    return { id: user?.id || null, name: user?.full_name || person.name, email: user?.email || person.email };
+  }).filter((person) => person.email);
+  const assignedIds = new Set(followups.map((item) => String(item.assigned_user_id || '')).filter(Boolean));
+  const assignedNames = new Set(followups.map((item) => normalize(item.assigned)).filter(Boolean));
+  const salesUsers = users
+    .filter((user) => normalize(user.department) === 'sales' || normalize(user.role).includes('sales') || assignedIds.has(user.id) || assignedNames.has(normalize(user.full_name)))
+    .filter((user) => user.full_name)
+    .map((user) => ({ id: user.id, name: user.full_name, email: user.email }));
+  const salespeople = [...configuredSalespeople, ...salesUsers].filter((person, index, all) =>
+    all.findIndex((item) => normalize(item.name) === normalize(person.name)) === index
+  );
+  const configuredAdmins = String(process.env.ADMIN_REPORT_EMAIL || process.env.ADMIN_EMAIL || '')
+    .split(',').map((email) => email.trim()).filter(Boolean);
+  const userAdmins = users
+    .filter((user) => normalize(user.role) === 'admin')
+    .map((user) => user.email);
+  const adminEmails = [...new Set([...configuredAdmins, ...userAdmins].map((email) => email.toLowerCase()))];
+  return { salespeople, adminEmails };
+};
+
+const sendDailyFollowupDigests = async (digestDate) => {
+  await ensureDailyDigestTable();
+  const { rows: followups } = await pool.query(
+    `SELECT lead_name, title, status, type, category, assigned, assigned_user_id, start_time,
+            TO_CHAR(start_time, 'DD Mon YYYY') AS start_date_label,
+            TO_CHAR(start_time, 'HH12:MI AM') AS start_time_label,
+            (start_time::date < $1::date) AS is_overdue,
+            description
+     FROM crm_followups
+     WHERE start_time::date <= $1 AND status IN ('Scheduled', 'Pending')
+     ORDER BY assigned NULLS LAST, start_time ASC`,
+    [digestDate]
+  );
+  const { salespeople, adminEmails } = await resolveDigestRecipients(followups);
+  const belongsTo = (item, person) => item.assigned_user_id && person.id
+    ? String(item.assigned_user_id) === String(person.id)
+    : normalize(item.assigned) === normalize(person.name);
+
+  for (const person of salespeople) {
+    const own = followups.filter((item) => belongsTo(item, person));
+    const overdueCount = own.filter((item) => item.is_overdue).length;
+    const todayCount = own.length - overdueCount;
+    const claimId = await claimDailyDigest(digestDate, person.email, 'salesperson');
+    if (!claimId) continue;
+    await deliverClaimedDigest({
+      claimId,
+      to: person.email,
+      subject: `Follow-ups: ${todayCount} today, ${overdueCount} overdue - ${digestDate}`,
+      html: `<p>Good morning ${escapeHtml(person.name)},</p><p>You have <strong>${todayCount}</strong> follow-up${todayCount === 1 ? '' : 's'} today and <strong>${overdueCount}</strong> overdue pending follow-up${overdueCount === 1 ? '' : 's'}.</p>${followupRowsHtml(own)}<p>Regards,<br/>Manod CRM</p>`,
+    });
+  }
+
+  const sections = salespeople.map((person) => {
+    const own = followups.filter((item) => belongsTo(item, person));
+    return `<h3 style="margin-top:24px;">${escapeHtml(person.name)} — ${own.length}</h3>${followupRowsHtml(own)}`;
+  }).join('');
+  const unassigned = followups.filter((item) => !salespeople.some((person) => belongsTo(item, person)));
+  const totalOverdue = followups.filter((item) => item.is_overdue).length;
+  const totalToday = followups.length - totalOverdue;
+  const adminHtml = `<p>Good morning,</p><p>There are <strong>${totalToday}</strong> follow-ups today and <strong>${totalOverdue}</strong> overdue pending follow-ups.</p>${sections}${unassigned.length ? `<h3 style="margin-top:24px;">Unassigned / Other — ${unassigned.length}</h3>${followupRowsHtml(unassigned)}` : ''}<p>Regards,<br/>Manod CRM</p>`;
+  for (const email of adminEmails) {
+    const claimId = await claimDailyDigest(digestDate, email, 'admin');
+    if (!claimId) continue;
+    await deliverClaimedDigest({ claimId, to: email, subject: `Sales follow-ups: ${totalToday} today, ${totalOverdue} overdue - ${digestDate}`, html: adminHtml });
+  }
+};
+
+const machineAlertRowsHtml = (items) => `
+  <table style="width:100%;border-collapse:collapse;font-size:13px;">
+    <thead><tr style="background:#166534;color:#fff;">
+      <th style="padding:9px;text-align:left;">Customer</th>
+      <th style="padding:9px;text-align:left;">Machine / Item</th>
+      <th style="padding:9px;text-align:left;">Alert</th>
+      <th style="padding:9px;text-align:left;">Due date</th>
+    </tr></thead>
+    <tbody>${items.map((item) => `<tr>
+      <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.customer_name)}</td>
+      <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.label)}</td>
+      <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.alert)}</td>
+      <td style="padding:9px;border-bottom:1px solid #e5e7eb;">${escapeHtml(item.due_date)}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+
+const claimMachineAlert = async (eventKey, email) => {
+  const { rows } = await pool.query(
+    `INSERT INTO crm_machine_automation_log (event_key, recipient_email)
+     VALUES ($1, LOWER($2)) ON CONFLICT (event_key, recipient_email) DO NOTHING RETURNING id`,
+    [eventKey, email]
+  );
+  return rows[0]?.id || null;
+};
+
+const deliverMachineAlert = async ({ eventKey, to, subject, html }) => {
+  const claimId = await claimMachineAlert(eventKey, to);
+  if (!claimId) return false;
+  const sent = await safeSendMail({ from: `"Manod CRM" <${process.env.EMAIL_USER}>`, to, subject, html });
+  if (sent) await pool.query(`UPDATE crm_machine_automation_log SET status='sent', sent_at=NOW() WHERE id=$1`, [claimId]);
+  else await pool.query(`DELETE FROM crm_machine_automation_log WHERE id=$1`, [claimId]);
+  return sent;
+};
+
+const machineReminderBand = (days) => {
+  if (days < 0) return 'overdue';
+  if (days === 0) return 'due';
+  if (days <= 7) return '7-day';
+  if (days <= 15) return '15-day';
+  return '30-day';
+};
+
+const processMachineServiceAutomations = async (digestDate) => {
+  await ensureMachineServiceTables();
+  const { rows: users } = await pool.query(`SELECT id::text AS id, full_name, email, role FROM users WHERE LOWER(COALESCE(status,'active'))='active'`);
+  const adminEmails = [...new Set([
+    ...String(process.env.ADMIN_REPORT_EMAIL || process.env.ADMIN_EMAIL || '').split(',').map((value) => value.trim()).filter(Boolean),
+    ...users.filter((user) => normalize(user.role) === 'admin').map((user) => user.email).filter(Boolean),
+  ].map((email) => email.toLowerCase()))];
+  const { rows: machines } = await pool.query(`
+    SELECT m.*, l.email AS customer_email,
+      (m.next_maintenance - $1::date) AS service_days,
+      (m.warranty_end - $1::date) AS warranty_days,
+      (m.amc_end - $1::date) AS amc_days
+    FROM crm_installed_machines m
+    LEFT JOIN crm_leads l ON l.id::text=m.lead_id
+    WHERE LOWER(COALESCE(m.status,'active'))='active'
+      AND (m.next_maintenance <= $1::date + 7 OR m.warranty_end <= $1::date + 30 OR m.amc_end <= $1::date + 30)
+  `, [digestDate]);
+  const { rows: consumables } = await pool.query(`
+    SELECT c.*, COALESCE(c.assigned_user_id, m.assigned_user_id) AS reminder_assigned_user_id,
+      COALESCE(c.assigned, m.assigned) AS reminder_assigned,
+      (c.next_requirement_date - $1::date) AS requirement_days
+    FROM crm_machine_consumables c
+    LEFT JOIN crm_installed_machines m ON m.id=c.machine_id
+    WHERE LOWER(COALESCE(c.status,'active'))='active'
+      AND LOWER(COALESCE(c.opportunity_status,'reminder due')) IN ('reminder due','quotation sent')
+      AND c.next_requirement_date <= $1::date + 7
+  `, [digestDate]);
+  const alertsByRecipient = new Map();
+  const addAlert = (email, eventKey, item) => {
+    if (!email) return;
+    const key = email.toLowerCase();
+    if (!alertsByRecipient.has(key)) alertsByRecipient.set(key, []);
+    alertsByRecipient.get(key).push({ eventKey, ...item });
+  };
+  for (const machine of machines) {
+    const assignedUser = users.find((user) => String(user.id) === String(machine.assigned_user_id)) || users.find((user) => normalize(user.full_name) === normalize(machine.assigned));
+    const recipients = [...new Set([assignedUser?.email, ...adminEmails].filter(Boolean))];
+    const definitions = [
+      ['service', machine.service_days, machine.next_maintenance, 'Service / maintenance'],
+      ['warranty', machine.warranty_days, machine.warranty_end, 'Warranty expiry'],
+      ['amc', machine.amc_days, machine.amc_end, 'AMC expiry'],
+    ];
+    for (const [type, rawDays, date, label] of definitions) {
+      if (rawDays === null || rawDays === undefined || Number(rawDays) > (type === 'service' ? 7 : 30)) continue;
+      const days = Number(rawDays);
+      const band = machineReminderBand(days);
+      const item = { customer_name: machine.customer_name, label: `${machine.machine_model}${machine.serial_number ? ` (${machine.serial_number})` : ''}`, alert: `${label} ${days < 0 ? `${Math.abs(days)} day(s) overdue` : days === 0 ? 'due today' : `in ${days} day(s)`}`, due_date: date };
+      for (const email of recipients) addAlert(email, `machine-${machine.id}-${type}-${band}`, item);
+      if (type === 'service' && days === 1 && machine.customer_email) {
+        await deliverMachineAlert({ eventKey: `machine-${machine.id}-customer-service-1-day-${date}`, to: machine.customer_email, subject: `Service reminder - ${machine.machine_model}`, html: `<p>Dear ${escapeHtml(machine.customer_name)},</p><p>This is a reminder that service for your <strong>${escapeHtml(machine.machine_model)}</strong> is scheduled for ${escapeHtml(date)}.</p><p>Regards,<br/>Manod CRM</p>` });
+      }
+      if (type === 'amc' && days <= 30 && days >= 0) {
+        await pool.query(`
+          INSERT INTO crm_machine_replacement_opportunities
+            (machine_id, lead_id, customer_name, current_model, replacement_reason, expected_purchase_date, stage, assigned_user_id, assigned, status, notes)
+          SELECT $1,$2,$3,$4,'AMC renewal / replacement review',$5,'New',$6,$7,'Open','Automatically created before AMC expiry'
+          WHERE NOT EXISTS (
+            SELECT 1 FROM crm_machine_replacement_opportunities
+            WHERE machine_id=$1 AND status='Open' AND replacement_reason='AMC renewal / replacement review'
+          )`, [machine.id, machine.lead_id, machine.customer_name, machine.machine_model, machine.amc_end, machine.assigned_user_id, machine.assigned]);
+      }
+    }
+  }
+  for (const consumable of consumables) {
+    const days = Number(consumable.requirement_days);
+    const band = machineReminderBand(days);
+    const item = { customer_name: consumable.customer_name, label: consumable.item_name, alert: days < 0 ? `Consumable ${Math.abs(days)} day(s) overdue` : days === 0 ? 'Consumable due today' : `Consumable required in ${days} day(s)`, due_date: consumable.next_requirement_date };
+    const assignedUser = users.find((user) => String(user.id) === String(consumable.reminder_assigned_user_id)) || users.find((user) => normalize(user.full_name) === normalize(consumable.reminder_assigned));
+    for (const email of [...new Set([assignedUser?.email, ...adminEmails].filter(Boolean))]) addAlert(email, `consumable-${consumable.id}-${band}`, item);
+  }
+  for (const [email, alerts] of alertsByRecipient) {
+    const pending = [];
+    for (const alert of alerts) {
+      const claimId = await claimMachineAlert(alert.eventKey, email);
+      if (claimId) pending.push({ claimId, alert });
+    }
+    if (!pending.length) continue;
+    const sent = await safeSendMail({ from: `"Manod CRM" <${process.env.EMAIL_USER}>`, to: email, subject: `Machine & service alerts - ${digestDate}`, html: `<p>Good morning,</p><p>The following machine-service activities require attention:</p>${machineAlertRowsHtml(pending.map((entry) => entry.alert))}<p>Regards,<br/>Manod CRM</p>` });
+    for (const { claimId } of pending) {
+      if (sent) await pool.query(`UPDATE crm_machine_automation_log SET status='sent', sent_at=NOW() WHERE id=$1`, [claimId]);
+      else await pool.query(`DELETE FROM crm_machine_automation_log WHERE id=$1`, [claimId]);
+    }
   }
 };
 
@@ -577,6 +1110,7 @@ const sendCustomerSuccessStageEmail = async (journey, stage) => {
   });
 };
 const ensureFollowup = async ({ lead, title, type = 'Call', category = 'Sales', daysFromNow = 1, desc }) => {
+  await ensureDailyDigestTable();
   const leadName = leadNameOf(lead);
   if (!leadName || !title) return null;
 
@@ -590,10 +1124,12 @@ const ensureFollowup = async ({ lead, title, type = 'Call', category = 'Sales', 
 
   const start = addDays(daysFromNow);
   const end = new Date(start.getTime() + 30 * 60 * 1000);
+  const assigned = leadAssignedOf(lead);
+  const assignedUserId = await resolveAssignedUserId(assigned, lead?.assigned_user_id || lead?.assignedUserId);
   const { rows } = await pool.query(
-    `INSERT INTO crm_followups (lead_name, title, status, type, category, assigned, start_time, end_time, description)
-     VALUES ($1, $2, 'Scheduled', $3, $4, $5, $6, $7, $8) RETURNING *`,
-    [leadName, title, type, category, leadAssignedOf(lead), start, end, desc || null]
+    `INSERT INTO crm_followups (lead_name, title, status, type, category, assigned, assigned_user_id, start_time, end_time, description)
+     VALUES ($1, $2, 'Scheduled', $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+    [leadName, title, type, category, assigned, assignedUserId, start, end, desc || null]
   );
   return rows[0];
 };
@@ -782,6 +1318,36 @@ const paymentReminderEmailContent = (stage, reminder) => {
       <p>Regards,<br/>Manod Technologies</p>
     `,
   };
+};
+
+const syncMachineRequirementFollowup = async (lead, requestedDate, activity) => {
+  if (!lead?.name || !requestedDate) return null;
+  await ensureDailyDigestTable();
+  const title = `Machine Requirement: ${activity || 'Customer follow-up'}`;
+  const start = new Date(requestedDate);
+  if (Number.isNaN(start.getTime())) return null;
+  const end = new Date(start.getTime() + 30 * 60 * 1000);
+  const assignedUserId = await resolveAssignedUserId(lead.assigned, lead.assigned_user_id || lead.assignedUserId);
+  const existing = await pool.query(
+    `SELECT id FROM crm_followups WHERE lead_name=$1 AND title LIKE 'Machine Requirement:%'
+     AND status IN ('Scheduled', 'Pending') ORDER BY created_at DESC LIMIT 1`,
+    [lead.name]
+  );
+  if (existing.rows[0]) {
+    const { rows } = await pool.query(
+      `UPDATE crm_followups SET title=$1, assigned=$2, assigned_user_id=$3, start_time=$4,
+       end_time=$5, description=$6, updated_at=NOW() WHERE id=$7 RETURNING *`,
+      [title, lead.assigned || null, assignedUserId, start, end, lead.requirement_details || null, existing.rows[0].id]
+    );
+    return rows[0];
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO crm_followups
+     (lead_name, title, status, type, category, assigned, assigned_user_id, start_time, end_time, description)
+     VALUES ($1,$2,'Scheduled','Call','Sales',$3,$4,$5,$6,$7) RETURNING *`,
+    [lead.name, title, lead.assigned || null, assignedUserId, start, end, lead.requirement_details || null]
+  );
+  return rows[0];
 };
 
 const sendPaymentReminderStageEmail = async (reminder, stage) => {
@@ -1034,6 +1600,14 @@ router.get('/leads', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+router.get('/leads/:id/locations', async (req, res) => {
+  try {
+    await ensureLeadExtraColumns();
+    const { rows } = await pool.query(`SELECT * FROM crm_lead_locations WHERE lead_id=$1 ORDER BY captured_at DESC, id DESC`, [String(req.params.id)]);
+    res.json({ success: true, locations: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.get('/leads/:id', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM crm_leads WHERE id=$1', [req.params.id]);
@@ -1047,6 +1621,9 @@ router.post('/leads', async (req, res) => {
       name, mobile, email, company, contact, location, industry, source, stage, assigned, notes, value,
       contactType, entityType, taxNumber, address1, address2, city, state, country, zipCode,
       landmark, streetName, buildingNumber, additionalNumber, customFields, contactPersons,
+      productCategory, machineType, application, requirementQuantity, installationLocation,
+      requirementDetails, budget, expectedPurchaseDate, quotationValue, competitorDetails,
+      nextFollowupDate, nextFollowupActivity, gpsLatitude, gpsLongitude, gpsAccuracy, gpsCapturedAt,
     } = req.body;
     await ensureLeadExtraColumns();
     const safeStage = stage === 'Won' ? 'New' : (stage || 'New');
@@ -1055,9 +1632,12 @@ router.post('/leads', async (req, res) => {
       `INSERT INTO crm_leads (
         name, mobile, email, company, contact, location, industry, source, stage, assigned, notes, value,
         contact_type, entity_type, tax_number, address1, address2, city, state, country, zip_code,
-        landmark, street_name, building_number, additional_number, custom_fields, contact_persons, lead_details
+        landmark, street_name, building_number, additional_number, custom_fields, contact_persons, lead_details,
+        product_category, machine_type, application, requirement_quantity, installation_location,
+        requirement_details, budget, expected_purchase_date, quotation_value, competitor_details,
+        next_followup_date, next_followup_activity, gps_latitude, gps_longitude, gps_accuracy, gps_captured_at
       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44) RETURNING *`,
       [
         name,
         mobile || null,
@@ -1086,10 +1666,21 @@ router.post('/leads', async (req, res) => {
         additionalNumber || null,
         jsonValue(customFields, {}),
         jsonValue(contactPersons, []),
-        jsonValue(req.body, {})
+        jsonValue(req.body, {}),
+        productCategory || null, machineType || null, application || null,
+        Number(requirementQuantity) || 0, installationLocation || location || null,
+        requirementDetails || null, Number(budget) || 0, expectedPurchaseDate || null,
+        Number(quotationValue) || Number(value) || 0, competitorDetails || null,
+        nextFollowupDate || null, nextFollowupActivity || null,
+        Number.isFinite(Number(gpsLatitude)) ? Number(gpsLatitude) : null,
+        Number.isFinite(Number(gpsLongitude)) ? Number(gpsLongitude) : null,
+        Number.isFinite(Number(gpsAccuracy)) ? Number(gpsAccuracy) : null,
+        gpsCapturedAt || null
       ]
     );
+    await saveLeadLocationHistory(rows[0].id, req.body);
     await runLeadAutomation(rows[0]);
+    await syncMachineRequirementFollowup(rows[0], nextFollowupDate, nextFollowupActivity);
     const [welcomeEmailSent, salespersonEmailSent] = await Promise.all([sendWelcomeEmail(rows[0]), notifySalesperson(rows[0])]);
     res.json({
       success: true,
@@ -1108,9 +1699,12 @@ router.put('/leads/:id', async (req, res) => {
       name, mobile, email, company, contact, location, industry, source, stage, assigned, notes, value,
       contactType, entityType, taxNumber, address1, address2, city, state, country, zipCode,
       landmark, streetName, buildingNumber, additionalNumber, customFields, contactPersons,
+      productCategory, machineType, application, requirementQuantity, installationLocation,
+      requirementDetails, budget, expectedPurchaseDate, quotationValue, competitorDetails,
+      nextFollowupDate, nextFollowupActivity, gpsLatitude, gpsLongitude, gpsAccuracy, gpsCapturedAt,
     } = req.body;
     await ensureLeadExtraColumns();
-    const current = await pool.query('SELECT stage FROM crm_leads WHERE id=$1', [req.params.id]);
+    const current = await pool.query('SELECT stage, gps_latitude, gps_longitude FROM crm_leads WHERE id=$1', [req.params.id]);
     const previousStage = current.rows[0]?.stage;
     if (stage === 'Won' && previousStage !== 'Won') {
       return res.status(400).json({ error: 'Accept a proposal to move this lead to Won.' });
@@ -1121,8 +1715,13 @@ router.put('/leads/:id', async (req, res) => {
         source=$8, stage=$9, assigned=$10, notes=$11, value=$12,
         contact_type=$13, entity_type=$14, tax_number=$15, address1=$16, address2=$17, city=$18,
         state=$19, country=$20, zip_code=$21, landmark=$22, street_name=$23, building_number=$24,
-        additional_number=$25, custom_fields=$26, contact_persons=$27, lead_details=$28, updated_at=NOW()
-       WHERE id=$29 RETURNING *`,
+        additional_number=$25, custom_fields=$26, contact_persons=$27, lead_details=$28,
+        product_category=$29, machine_type=$30, application=$31, requirement_quantity=$32,
+        installation_location=$33, requirement_details=$34, budget=$35, expected_purchase_date=$36,
+        quotation_value=$37, competitor_details=$38, next_followup_date=$39,
+        next_followup_activity=$40, gps_latitude=$41, gps_longitude=$42, gps_accuracy=$43,
+        gps_captured_at=$44, updated_at=NOW()
+       WHERE id=$45 RETURNING *`,
       [
         name,
         mobile || null,
@@ -1152,11 +1751,26 @@ router.put('/leads/:id', async (req, res) => {
         jsonValue(customFields, {}),
         jsonValue(contactPersons, []),
         jsonValue(req.body, {}),
+        productCategory || null, machineType || null, application || null,
+        Number(requirementQuantity) || 0, installationLocation || location || null,
+        requirementDetails || null, Number(budget) || 0, expectedPurchaseDate || null,
+        Number(quotationValue) || Number(value) || 0, competitorDetails || null,
+        nextFollowupDate || null, nextFollowupActivity || null,
+        Number.isFinite(Number(gpsLatitude)) ? Number(gpsLatitude) : null,
+        Number.isFinite(Number(gpsLongitude)) ? Number(gpsLongitude) : null,
+        Number.isFinite(Number(gpsAccuracy)) ? Number(gpsAccuracy) : null,
+        gpsCapturedAt || null,
         req.params.id,
       ]
     );
     if (rows[0]) {
+      const nextLatitude = Number(gpsLatitude);
+      const nextLongitude = Number(gpsLongitude);
+      const locationChanged = Number.isFinite(nextLatitude) && Number.isFinite(nextLongitude)
+        && (Number(current.rows[0]?.gps_latitude) !== nextLatitude || Number(current.rows[0]?.gps_longitude) !== nextLongitude);
+      if (locationChanged) await saveLeadLocationHistory(rows[0].id, req.body);
       await runLeadAutomation(rows[0], previousStage);
+      await syncMachineRequirementFollowup(rows[0], nextFollowupDate, nextFollowupActivity);
     }
     res.json({ success: true, lead: rows[0] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1258,10 +1872,13 @@ router.post('/leads/:id/ai-call', async (req, res) => {
 
     const start = addDays(1);
     const end = new Date(start.getTime() + 30 * 60 * 1000);
+    await ensureDailyDigestTable();
+    const assigned = leadAssignedOf(lead);
+    const assignedUserId = await resolveAssignedUserId(assigned, lead.assigned_user_id || lead.assignedUserId);
     const { rows: followupRows } = await pool.query(
-      `INSERT INTO crm_followups (lead_name, title, status, type, category, assigned, start_time, end_time, description)
-       VALUES ($1, $2, 'Scheduled', 'Call', 'Sales', $3, $4, $5, $6) RETURNING *`,
-      [leadName, 'AI call follow-up', leadAssignedOf(lead), start, end, `Twilio AI call started. Call SID: ${call.sid}. Message: ${message}`]
+      `INSERT INTO crm_followups (lead_name, title, status, type, category, assigned, assigned_user_id, start_time, end_time, description)
+       VALUES ($1, $2, 'Scheduled', 'Call', 'Sales', $3, $4, $5, $6, $7) RETURNING *`,
+      [leadName, 'AI call follow-up', assigned, assignedUserId, start, end, `Twilio AI call started. Call SID: ${call.sid}. Message: ${message}`]
     );
 
     res.json({
@@ -1286,6 +1903,7 @@ router.get('/followups', async (req, res) => {
       type: r.type,
       category: r.category,
       assigned: r.assigned,
+      assignedUserId: r.assigned_user_id,
       start: r.start_time ? new Date(r.start_time).toISOString().slice(0, 16) : '',
       end: r.end_time ? new Date(r.end_time).toISOString().slice(0, 16) : '',
       desc: r.description || '',
@@ -1296,16 +1914,18 @@ router.get('/followups', async (req, res) => {
 
 router.post('/followups', async (req, res) => {
   try {
-    const { lead, lead_name, title, status, type, category, assigned, start, start_time, end, end_time, desc, description } = req.body;
+    await ensureDailyDigestTable();
+    const { lead, lead_name, title, status, type, category, assigned, assignedUserId, assigned_user_id, start, start_time, end, end_time, desc, description } = req.body;
     const leadVal = lead || lead_name || null;
     const startVal = start || start_time || null;
     const endVal = end || end_time || null;
     const descVal = desc || description || null;
+    const assignedIdVal = await resolveAssignedUserId(assigned, assignedUserId || assigned_user_id);
 
     const { rows } = await pool.query(
-      `INSERT INTO crm_followups (lead_name, title, status, type, category, assigned, start_time, end_time, description)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [leadVal, title, status || 'Scheduled', type || 'Call', category || 'Sales', assigned || null, startVal, endVal, descVal]
+      `INSERT INTO crm_followups (lead_name, title, status, type, category, assigned, assigned_user_id, start_time, end_time, description)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [leadVal, title, status || 'Scheduled', type || 'Call', category || 'Sales', assigned || null, assignedIdVal, startVal, endVal, descVal]
     );
     res.json({ success: true, followup: rows[0] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1313,16 +1933,18 @@ router.post('/followups', async (req, res) => {
 
 router.put('/followups/:id', async (req, res) => {
   try {
-    const { lead, lead_name, title, status, type, category, assigned, start, start_time, end, end_time, desc, description } = req.body;
+    await ensureDailyDigestTable();
+    const { lead, lead_name, title, status, type, category, assigned, assignedUserId, assigned_user_id, start, start_time, end, end_time, desc, description } = req.body;
     const leadVal = lead || lead_name || null;
     const startVal = start || start_time || null;
     const endVal = end || end_time || null;
     const descVal = desc || description || null;
+    const assignedIdVal = await resolveAssignedUserId(assigned, assignedUserId || assigned_user_id);
 
     const { rows } = await pool.query(
       `UPDATE crm_followups SET lead_name=$1, title=$2, status=$3, type=$4, category=$5,
-       assigned=$6, start_time=$7, end_time=$8, description=$9, updated_at=NOW() WHERE id=$10 RETURNING *`,
-      [leadVal, title, status, type, category, assigned || null, startVal, endVal, descVal, req.params.id]
+       assigned=$6, assigned_user_id=$7, start_time=$8, end_time=$9, description=$10, updated_at=NOW() WHERE id=$11 RETURNING *`,
+      [leadVal, title, status, type, category, assigned || null, assignedIdVal, startVal, endVal, descVal, req.params.id]
     );
     res.json({ success: true, followup: rows[0] });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1877,6 +2499,344 @@ router.put('/customer-success/:id', async (req, res) => {
     res.json({ success: true, customerSuccess: rows[0], automation: { customerEmailSent } });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// INSTALLED MACHINES & AFTER-SALES SERVICE
+router.get('/machines', authenticateToken, requirePermission('Machine Service', 'View machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const { rows } = await pool.query(`
+      SELECT m.*, COUNT(s.id)::int AS service_count, MAX(s.service_date) AS last_service_date
+      FROM crm_installed_machines m
+      LEFT JOIN crm_machine_services s ON s.machine_id=m.id
+      GROUP BY m.id
+      ORDER BY m.created_at DESC
+    `);
+    res.json({ success: true, machines: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/machines', authenticateToken, requirePermission('Machine Service', 'Add machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const b = req.body || {};
+    const linkedLeadId = b.leadId || b.lead_id || null;
+    if (!linkedLeadId) return res.status(400).json({ error: 'Select a customer from Customer Success.' });
+    const customerSuccess = await pool.query(`SELECT id FROM crm_customer_success WHERE lead_id=$1 LIMIT 1`, [String(linkedLeadId)]);
+    if (!customerSuccess.rows.length) return res.status(400).json({ error: 'Installed machines can be added only for customers in Customer Success.' });
+    if (!b.customerName && !b.customer_name) return res.status(400).json({ error: 'Customer is required.' });
+    if (!b.machineModel && !b.machine_model) return res.status(400).json({ error: 'Machine model is required.' });
+    const assignedUserId = await resolveAssignedUserId(b.assigned, b.assignedUserId || b.assigned_user_id);
+    const { rows } = await pool.query(
+      `INSERT INTO crm_installed_machines
+       (lead_id, customer_name, machine_model, serial_number, installation_date, warranty_start,
+        warranty_end, next_maintenance, spare_requirement, amc_status, amc_start, amc_end,
+        location, assigned_user_id, assigned, status, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+      [linkedLeadId, b.customerName || b.customer_name, b.machineModel || b.machine_model,
+       b.serialNumber || b.serial_number || null, b.installationDate || b.installation_date || null,
+       b.warrantyStart || b.warranty_start || null, b.warrantyEnd || b.warranty_end || null,
+       b.nextMaintenance || b.next_maintenance || null, b.spareRequirement || b.spare_requirement || null,
+       b.amcStatus || b.amc_status || 'Not Applicable', b.amcStart || b.amc_start || null,
+       b.amcEnd || b.amc_end || null, b.location || null, assignedUserId, b.assigned || null,
+       b.status || 'Active', b.notes || null]
+    );
+    res.json({ success: true, machine: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Serial number already exists.' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/machines/:id', authenticateToken, requirePermission('Machine Service', 'Edit machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const b = req.body || {};
+    const linkedLeadId = b.leadId || b.lead_id || null;
+    if (!linkedLeadId) return res.status(400).json({ error: 'Select a customer from Customer Success.' });
+    const customerSuccess = await pool.query(`SELECT id FROM crm_customer_success WHERE lead_id=$1 LIMIT 1`, [String(linkedLeadId)]);
+    if (!customerSuccess.rows.length) return res.status(400).json({ error: 'Installed machines can be linked only to customers in Customer Success.' });
+    const assignedUserId = await resolveAssignedUserId(b.assigned, b.assignedUserId || b.assigned_user_id);
+    const { rows } = await pool.query(
+      `UPDATE crm_installed_machines SET
+       lead_id=$1, customer_name=$2, machine_model=$3, serial_number=$4, installation_date=$5,
+       warranty_start=$6, warranty_end=$7, next_maintenance=$8, spare_requirement=$9,
+       amc_status=$10, amc_start=$11, amc_end=$12, location=$13, assigned_user_id=$14,
+       assigned=$15, status=$16, notes=$17, updated_at=NOW() WHERE id=$18 RETURNING *`,
+      [linkedLeadId, b.customerName || b.customer_name, b.machineModel || b.machine_model,
+       b.serialNumber || b.serial_number || null, b.installationDate || b.installation_date || null,
+       b.warrantyStart || b.warranty_start || null, b.warrantyEnd || b.warranty_end || null,
+       b.nextMaintenance || b.next_maintenance || null, b.spareRequirement || b.spare_requirement || null,
+       b.amcStatus || b.amc_status || 'Not Applicable', b.amcStart || b.amc_start || null,
+       b.amcEnd || b.amc_end || null, b.location || null, assignedUserId, b.assigned || null,
+       b.status || 'Active', b.notes || null, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Machine not found.' });
+    res.json({ success: true, machine: rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Serial number already exists.' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/machines/:id', authenticateToken, requirePermission('Machine Service', 'Delete machine service'), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM crm_installed_machines WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/machines/:id/services', authenticateToken, requirePermission('Machine Service', 'View machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const { rows } = await pool.query(`
+      SELECT s.*, COUNT(a.id)::int AS attachment_count
+      FROM crm_machine_services s
+      LEFT JOIN crm_machine_service_attachments a ON a.service_id=s.id
+      WHERE s.machine_id=$1 GROUP BY s.id ORDER BY s.service_date DESC, s.id DESC`, [req.params.id]);
+    res.json({ success: true, services: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/machines/:id/services', authenticateToken, requirePermission('Machine Service', 'Add machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const b = req.body || {};
+    if (!b.serviceDate && !b.service_date) return res.status(400).json({ error: 'Service date is required.' });
+    const rating = b.customerRating || b.customer_rating || null;
+    if (rating && (Number(rating) < 1 || Number(rating) > 5)) return res.status(400).json({ error: 'Customer rating must be between 1 and 5.' });
+    const downtimeStart = b.downtimeStart || b.downtime_start || null;
+    const downtimeEnd = b.downtimeEnd || b.downtime_end || null;
+    const downtimeMinutes = downtimeStart && downtimeEnd
+      ? Math.max(0, Math.round((new Date(downtimeEnd).getTime() - new Date(downtimeStart).getTime()) / 60000)) : 0;
+    const laborCost = Number(b.laborCost || b.labor_cost) || 0;
+    const spareCost = Number(b.spareCost || b.spare_cost) || 0;
+    const travelCost = Number(b.travelCost || b.travel_cost) || 0;
+    const totalCost = laborCost + spareCost + travelCost;
+    const { rows } = await pool.query(
+      `INSERT INTO crm_machine_services
+       (machine_id, service_date, service_type, issue_reported, work_performed, spare_used,
+        technician, next_service_date, status, cost, notes, service_category, assigned_technician_id,
+        customer_contact_name, customer_contact_phone, coverage_status, resolution_status,
+        labor_cost, spare_cost, travel_cost, downtime_start, downtime_end, downtime_minutes,
+        customer_confirmation_name, customer_feedback, customer_rating)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) RETURNING *`,
+      [req.params.id, b.serviceDate || b.service_date, b.serviceType || b.service_type || 'Preventive Maintenance',
+       b.issueReported || b.issue_reported || null, b.workPerformed || b.work_performed || null,
+       b.spareUsed || b.spare_used || null, b.technician || null,
+       b.nextServiceDate || b.next_service_date || null, b.status || 'Completed', totalCost, b.notes || null,
+       b.serviceCategory || b.service_category || b.serviceType || b.service_type || 'Preventive Maintenance',
+       b.assignedTechnicianId || b.assigned_technician_id || null,
+       b.customerContactName || b.customer_contact_name || null, b.customerContactPhone || b.customer_contact_phone || null,
+       b.coverageStatus || b.coverage_status || 'Chargeable', b.resolutionStatus || b.resolution_status || 'Resolved',
+       laborCost, spareCost, travelCost, downtimeStart, downtimeEnd, downtimeMinutes,
+       b.customerConfirmationName || b.customer_confirmation_name || null, b.customerFeedback || b.customer_feedback || null,
+       rating ? Number(rating) : null]
+    );
+    if (b.nextServiceDate || b.next_service_date) {
+      await pool.query('UPDATE crm_installed_machines SET next_maintenance=$1, updated_at=NOW() WHERE id=$2', [b.nextServiceDate || b.next_service_date, req.params.id]);
+    }
+    res.json({ success: true, service: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/machine-services/:id', authenticateToken, requirePermission('Machine Service', 'Delete machine service'), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM crm_machine_services WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/machine-services/:id/attachments', authenticateToken, requirePermission('Machine Service', 'View machine service'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT id, service_id, file_name, mime_type, file_size, created_at FROM crm_machine_service_attachments WHERE service_id=$1 ORDER BY created_at DESC`, [req.params.id]);
+    res.json({ success: true, attachments: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/machine-services/:id/attachments', authenticateToken, requirePermission('Machine Service', 'Add machine service'), async (req, res) => {
+  try {
+    const { fileName, mimeType, base64Data } = req.body || {};
+    if (!fileName || !mimeType || !base64Data) return res.status(400).json({ error: 'Attachment file data is required.' });
+    const fileData = Buffer.from(String(base64Data).replace(/^data:[^;]+;base64,/, ''), 'base64');
+    if (!fileData.length) return res.status(400).json({ error: 'Attachment is empty.' });
+    if (fileData.length > 5 * 1024 * 1024) return res.status(400).json({ error: 'Attachment must be 5 MB or smaller.' });
+    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+    if (!allowed.includes(mimeType)) return res.status(400).json({ error: 'Only PDF, JPG, PNG and WebP attachments are allowed.' });
+    const { rows } = await pool.query(`INSERT INTO crm_machine_service_attachments (service_id,file_name,mime_type,file_size,file_data,uploaded_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,service_id,file_name,mime_type,file_size,created_at`, [req.params.id, fileName, mimeType, fileData.length, fileData, String(req.user?.id || '') || null]);
+    res.json({ success: true, attachment: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/machine-service-attachments/:id/download', authenticateToken, requirePermission('Machine Service', 'View machine service'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT file_name,mime_type,file_data FROM crm_machine_service_attachments WHERE id=$1`, [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Attachment not found.' });
+    res.setHeader('Content-Type', rows[0].mime_type);
+    res.setHeader('Content-Disposition', `attachment; filename="${String(rows[0].file_name).replace(/["\r\n]/g, '')}"`);
+    res.send(rows[0].file_data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/machine-consumables', authenticateToken, requirePermission('Machine Service', 'View machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const { rows } = await pool.query(`SELECT * FROM crm_machine_consumables ORDER BY next_requirement_date NULLS LAST, created_at DESC`);
+    res.json({ success: true, consumables: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+const consumableNextRequirement = (body) => {
+  if (body.nextRequirementDate || body.next_requirement_date) return body.nextRequirementDate || body.next_requirement_date;
+  const supplied = body.lastSuppliedDate || body.last_supplied_date;
+  if (!supplied) return null;
+  const date = new Date(`${supplied}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setUTCDate(date.getUTCDate() + (Math.max(1, Number(body.frequencyDays || body.frequency_days) || 30)));
+  return date.toISOString().slice(0, 10);
+};
+
+router.post('/machine-consumables', authenticateToken, requirePermission('Machine Service', 'Add machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const b = req.body || {};
+    if (!b.customerName && !b.customer_name) return res.status(400).json({ error: 'Customer is required.' });
+    if (!b.itemName && !b.item_name) return res.status(400).json({ error: 'Consumable item is required.' });
+    const assignedUserId = await resolveAssignedUserId(b.assigned, b.assignedUserId || b.assigned_user_id);
+    const nextRequirementDate = consumableNextRequirement(b);
+    const { rows } = await pool.query(
+      `INSERT INTO crm_machine_consumables
+       (machine_id, lead_id, customer_name, item_name, category, quantity, unit, reorder_level,
+        last_supplied_date, next_requirement_date, unit_price, status, notes, sku, brand, specification,
+        supply_type, order_invoice_number, purchase_cost, tax_percent, last_supplied_quantity,
+        consumption_frequency, frequency_days, assigned_user_id, assigned, opportunity_status,
+        customer_contact_name, customer_contact_phone)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28) RETURNING *`,
+      [b.machineId || b.machine_id || null, b.leadId || b.lead_id || null, b.customerName || b.customer_name,
+       b.itemName || b.item_name, b.category || 'Consumable', Number(b.quantity) || 0, b.unit || 'Nos',
+       Number(b.reorderLevel || b.reorder_level) || 0, b.lastSuppliedDate || b.last_supplied_date || null,
+       nextRequirementDate, Number(b.unitPrice || b.unit_price) || 0, b.status || 'Active', b.notes || null,
+       b.sku || null, b.brand || null, b.specification || null, b.supplyType || b.supply_type || 'Sale',
+       b.orderInvoiceNumber || b.order_invoice_number || null, Number(b.purchaseCost || b.purchase_cost) || 0,
+       Number(b.taxPercent || b.tax_percent) || 0, Number(b.lastSuppliedQuantity || b.last_supplied_quantity) || 0,
+       b.consumptionFrequency || b.consumption_frequency || 'Monthly', Math.max(1, Number(b.frequencyDays || b.frequency_days) || 30),
+       assignedUserId, b.assigned || null, b.opportunityStatus || b.opportunity_status || 'Reminder Due',
+       b.customerContactName || b.customer_contact_name || null, b.customerContactPhone || b.customer_contact_phone || null]
+    );
+    res.json({ success: true, consumable: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.put('/machine-consumables/:id', authenticateToken, requirePermission('Machine Service', 'Edit machine service'), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const assignedUserId = await resolveAssignedUserId(b.assigned, b.assignedUserId || b.assigned_user_id);
+    const nextRequirementDate = consumableNextRequirement(b);
+    const { rows } = await pool.query(
+      `UPDATE crm_machine_consumables SET machine_id=$1, lead_id=$2, customer_name=$3, item_name=$4,
+       category=$5, quantity=$6, unit=$7, reorder_level=$8, last_supplied_date=$9,
+       next_requirement_date=$10, unit_price=$11, status=$12, notes=$13, sku=$14, brand=$15,
+       specification=$16, supply_type=$17, order_invoice_number=$18, purchase_cost=$19,
+       tax_percent=$20, last_supplied_quantity=$21, consumption_frequency=$22, frequency_days=$23,
+       assigned_user_id=$24, assigned=$25, opportunity_status=$26, customer_contact_name=$27,
+       customer_contact_phone=$28, updated_at=NOW() WHERE id=$29 RETURNING *`,
+      [b.machineId || b.machine_id || null, b.leadId || b.lead_id || null, b.customerName || b.customer_name,
+       b.itemName || b.item_name, b.category || 'Consumable', Number(b.quantity) || 0, b.unit || 'Nos',
+       Number(b.reorderLevel || b.reorder_level) || 0, b.lastSuppliedDate || b.last_supplied_date || null,
+       nextRequirementDate, Number(b.unitPrice || b.unit_price) || 0, b.status || 'Active', b.notes || null,
+       b.sku || null, b.brand || null, b.specification || null, b.supplyType || b.supply_type || 'Sale',
+       b.orderInvoiceNumber || b.order_invoice_number || null, Number(b.purchaseCost || b.purchase_cost) || 0,
+       Number(b.taxPercent || b.tax_percent) || 0, Number(b.lastSuppliedQuantity || b.last_supplied_quantity) || 0,
+       b.consumptionFrequency || b.consumption_frequency || 'Monthly', Math.max(1, Number(b.frequencyDays || b.frequency_days) || 30),
+       assignedUserId, b.assigned || null, b.opportunityStatus || b.opportunity_status || 'Reminder Due',
+       b.customerContactName || b.customer_contact_name || null, b.customerContactPhone || b.customer_contact_phone || null,
+       req.params.id]
+    );
+    res.json({ success: true, consumable: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/machine-consumables/:id', authenticateToken, requirePermission('Machine Service', 'Delete machine service'), async (req, res) => {
+  try { await pool.query('DELETE FROM crm_machine_consumables WHERE id=$1', [req.params.id]); res.json({ success: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/machine-replacements', authenticateToken, requirePermission('Machine Service', 'View machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const { rows } = await pool.query(`SELECT * FROM crm_machine_replacement_opportunities ORDER BY created_at DESC`);
+    res.json({ success: true, replacements: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/machine-replacements', authenticateToken, requirePermission('Machine Service', 'Add machine service'), async (req, res) => {
+  try {
+    await ensureMachineServiceTables();
+    const b = req.body || {};
+    if (!b.customerName && !b.customer_name) return res.status(400).json({ error: 'Customer is required.' });
+    const assignedUserId = await resolveAssignedUserId(b.assigned, b.assignedUserId || b.assigned_user_id);
+    const { rows } = await pool.query(
+      `INSERT INTO crm_machine_replacement_opportunities
+       (machine_id, lead_id, customer_name, current_model, replacement_reason, proposed_model,
+        expected_purchase_date, estimated_value, stage, assigned_user_id, assigned, status, notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [b.machineId || b.machine_id || null, b.leadId || b.lead_id || null, b.customerName || b.customer_name,
+       b.currentModel || b.current_model || null, b.replacementReason || b.replacement_reason || null,
+       b.proposedModel || b.proposed_model || null, b.expectedPurchaseDate || b.expected_purchase_date || null,
+       Number(b.estimatedValue || b.estimated_value) || 0, b.stage || 'New', assignedUserId,
+       b.assigned || null, b.status || 'Open', b.notes || null]
+    );
+    res.json({ success: true, replacement: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.put('/machine-replacements/:id', authenticateToken, requirePermission('Machine Service', 'Edit machine service'), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const assignedUserId = await resolveAssignedUserId(b.assigned, b.assignedUserId || b.assigned_user_id);
+    const { rows } = await pool.query(
+      `UPDATE crm_machine_replacement_opportunities SET machine_id=$1, lead_id=$2, customer_name=$3,
+       current_model=$4, replacement_reason=$5, proposed_model=$6, expected_purchase_date=$7,
+       estimated_value=$8, stage=$9, assigned_user_id=$10, assigned=$11, status=$12,
+       notes=$13, updated_at=NOW() WHERE id=$14 RETURNING *`,
+      [b.machineId || b.machine_id || null, b.leadId || b.lead_id || null, b.customerName || b.customer_name,
+       b.currentModel || b.current_model || null, b.replacementReason || b.replacement_reason || null,
+       b.proposedModel || b.proposed_model || null, b.expectedPurchaseDate || b.expected_purchase_date || null,
+       Number(b.estimatedValue || b.estimated_value) || 0, b.stage || 'New', assignedUserId,
+       b.assigned || null, b.status || 'Open', b.notes || null, req.params.id]
+    );
+    res.json({ success: true, replacement: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/machine-replacements/:id', authenticateToken, requirePermission('Machine Service', 'Delete machine service'), async (req, res) => {
+  try { await pool.query('DELETE FROM crm_machine_replacement_opportunities WHERE id=$1', [req.params.id]); res.json({ success: true }); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/settings', async (_req, res) => {
+  try {
+    await ensureCrmSettingsTable();
+    const { rows } = await pool.query(`SELECT * FROM crm_settings WHERE id=1`);
+    res.json({ success: true, settings: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.put('/settings', async (req, res) => {
+  try {
+    await ensureCrmSettingsTable();
+    const body = req.body || {};
+    const companyName = String(body.companyName || body.company_name || '').trim();
+    if (!companyName) return res.status(400).json({ error: 'Company name is required.' });
+    const { rows } = await pool.query(`
+      UPDATE crm_settings SET company_name=$1, currency=$2, default_assigned=$3,
+        default_stage=$4, default_source=$5, updated_by=$6, updated_at=NOW()
+      WHERE id=1 RETURNING *`,
+    [companyName, body.currency || 'INR', body.defaultAssigned || body.default_assigned || null,
+      body.defaultStage || body.default_stage || 'New', body.defaultSource || body.default_source || 'Website',
+      String(req.user?.id || '') || null]);
+    res.json({ success: true, settings: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // DASHBOARD STATS ROUTE
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 router.get('/dashboard/stats', async (req, res) => {
@@ -1892,6 +2852,7 @@ router.get('/dashboard/stats', async (req, res) => {
 });
 
 let proposalAutomationRunning = false;
+let dailyDigestRunning = false;
 const runProposalAutomationCycle = async () => {
   if (proposalAutomationRunning) return;
   proposalAutomationRunning = true;
@@ -1904,10 +2865,26 @@ const runProposalAutomationCycle = async () => {
   }
 };
 
+const runDailyDigestCycle = async () => {
+  const india = indiaNowParts();
+  if (india.hour !== 9 || dailyDigestRunning) return;
+  dailyDigestRunning = true;
+  try {
+    await processMachineServiceAutomations(india.date);
+    await sendDailyFollowupDigests(india.date);
+  } catch (err) {
+    console.error('daily CRM automation failed:', err.message);
+  } finally {
+    dailyDigestRunning = false;
+  }
+};
+
 if (process.env.NODE_ENV !== 'test') {
   const intervalMinutes = Math.max(1, Number(process.env.PROPOSAL_AUTOMATION_INTERVAL_MINUTES) || 15);
   setTimeout(runProposalAutomationCycle, 10000);
   setInterval(runProposalAutomationCycle, intervalMinutes * 60 * 1000);
+  setTimeout(runDailyDigestCycle, 15000);
+  setInterval(runDailyDigestCycle, 60 * 1000);
 }
 
 module.exports = router;
