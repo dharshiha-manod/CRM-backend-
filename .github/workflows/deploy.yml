@@ -1,25 +1,5 @@
-name: Deploy Backend to Elastic Beanstalk
-
-on:
-  push:
-    branches:
-      - main
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      - name: Install dependencies
-        run: npm install
+      - name: Create deployment package
+        run: zip -r deployment.zip . -x "*.git*" "node_modules/*"
 
       - name: Deploy to Elastic Beanstalk
         uses: einaregilsson/beanstalk-deploy@v22
@@ -30,4 +10,4 @@ jobs:
           application_name: ${{ secrets.EB_APPLICATION_NAME }}
           environment_name: ${{ secrets.EB_ENVIRONMENT_NAME }}
           version_label: "v-${{ github.run_number }}"
-          deployment_package: .
+          deployment_package: deployment.zip
