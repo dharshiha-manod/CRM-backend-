@@ -12,11 +12,12 @@ require('dotenv').config();
 const app = express();
 
 // â”€â”€ MIDDLEWARE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-const configuredOrigins = (process.env.FRONTEND_URL || '')
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
+const configuredOrigins = [
+  "https://main.d2sm5uwtoq6ll0.amplifyapp.com",
+  "https://main.d38u4xwtujcspz.amplifyapp.com",
+  "http://localhost:5173",
+  "http://localhost:4173"
+];
 const isAllowedFrontendOrigin = (origin) => {
   if (!origin) return true;
   if (configuredOrigins.includes(origin)) return true;
@@ -25,13 +26,28 @@ const isAllowedFrontendOrigin = (origin) => {
 
 app.use(cors({
   origin(origin, callback) {
-    if (isAllowedFrontendOrigin(origin)) return callback(null, true);
-    return callback(new Error(`CORS blocked origin: ${origin}`));
+    if (!origin || isAllowedFrontendOrigin(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked origin: ${origin}`));
+    }
   },
-  credentials:    true,
-  methods:        ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  credentials: true,
+  methods: [
+    'GET',
+    'POST',
+    'PUT',
+    'DELETE',
+    'PATCH',
+    'OPTIONS'
+  ],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization'
+  ]
 }));
+
+app.options('*', cors());
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
