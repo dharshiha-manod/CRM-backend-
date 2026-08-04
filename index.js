@@ -5,7 +5,21 @@ require("dotenv").config();
 
 const app = express();
 
-app.use(cors());
+const cors = require("cors");
+
+const corsOptions = {
+  origin: [
+    "https://main.d38u4xwtujcspz.amplifyapp.com"
+  ],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+app.use(express.json());
 app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────
