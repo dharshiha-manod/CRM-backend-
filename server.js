@@ -49,7 +49,8 @@ app.use(cors({
 
 app.options('*', cors());
 
-app.use(express.json({ limit: '8mb' })); (collegue)
+
+app.use(express.json({ limit: '8mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // Request logging
